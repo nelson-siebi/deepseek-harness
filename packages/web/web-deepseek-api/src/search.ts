@@ -1,6 +1,7 @@
 /**
  * DeepSeek Search API provider: one direct request per search, without an
- * auxiliary model request.
+ * auxiliary model request. Falls back to DuckDuckGo HTML search when no valid
+ * DeepSeek API credential is available (e.g. local Ollama / custom providers).
  * @module @deepseek-ai/dsh-web-deepseek-api/search
  */
 import type { WebSearchProvider, WebSearchRequest, WebSearchResult } from '@deepseek-ai/dsh-web'
@@ -64,8 +65,8 @@ export function mapSearchResponse(response: unknown): WebSearchResult {
 }
 
 /**
- * Search through the DeepSeek Search API. HTTP redirects fail as `WEB_PROVIDER_ERROR`;
- * failures after dispatch name the endpoint and tell the model how the user can configure it.
+ * Search through the DeepSeek Search API, with automatic fallback to free
+ * DuckDuckGo web search when DeepSeek credentials are missing or rejected.
  */
 export class DeepSeekSearchApiProvider implements WebSearchProvider {
   readonly id = DEEPSEEK_SEARCH_API_PROVIDER_ID
@@ -73,14 +74,14 @@ export class DeepSeekSearchApiProvider implements WebSearchProvider {
   private readonly starts: number[] = []
   /** Picker description: what this provider suits and what it costs or cannot do. */
   readonly description: NonNullable<WebSearchProvider['description']> = {
-    en: 'Incurs charges, paid by the account or API key chosen under Billing.',
-    zh: '会产生费用，由「计费方式」选定的账号或 API Key 支付。',
-    ja: '料金が発生し、「課金方法」で選んだアカウントまたは API キーに請求されます。',
-    es: 'Genera cargos, que paga la cuenta o la clave de API elegida en Facturación.',
-    fr: 'Entraîne des frais, payés par le compte ou la clé API choisi dans Facturation.',
-    de: 'Verursacht Kosten, die das unter Abrechnung gewählte Konto oder der API-Schlüssel trägt.',
-    ru: 'Услуга платная: оплата идёт с аккаунта или ключа API, выбранного в разделе «Оплата».',
-    pt: 'Gera cobranças, pagas pela conta ou chave de API escolhida em Cobrança.',
+    en: 'Uses DeepSeek Search API when configured, or falls back to free web search (DuckDuckGo).',
+    zh: '配置了 DeepSeek API 时使用官方搜索，否则自动回退到免费网页搜索（DuckDuckGo）。',
+    ja: '設定時は DeepSeek Search API を使用し、未設定時は無料ウェブ検索（DuckDuckGo）にフォールバックします。',
+    es: 'Usa la API de búsqueda de DeepSeek si está configurada, o recurre a búsqueda web gratuita (DuckDuckGo).',
+    fr: 'Utilise l’API de recherche DeepSeek si configurée, sinon bascule automatiquement sur la recherche web gratuite (DuckDuckGo).',
+    de: 'Nutzt bei Konfiguration die DeepSeek-Such-API oder fällt auf kostenlose Websuche (DuckDuckGo) zurück.',
+    ru: 'Использует DeepSeek Search API при наличии ключа или автоматически переключается на бесплатный веб-поиск (DuckDuckGo).',
+    pt: 'Usa a API de busca do DeepSeek quando configurada, ou recorre à busca web gratuita (DuckDuckGo).',
   }
 
   /**
@@ -91,24 +92,31 @@ export class DeepSeekSearchApiProvider implements WebSearchProvider {
 
   available(): boolean {
     const options = this.resolveOptions()
-    return hasDeepSeekWebCredential(options.auth)
-      && isPositiveInteger(options.count) && isPositiveInteger(options.requestsPerSecond)
+    return isPositiveInteger(options.count) && isPositiveInteger(options.requestsPerSecond)
   }
 
   async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
     const options = this.resolveOptions()
-    const question = boundedQuestion(options.originalQuestion?.())
-    return dispatchDeepSeekWeb(options.auth, {
-      body: {
-        query: request.query,
-        count: Math.min(options.count, request.maxResults ?? options.count),
-        need_content: false,
-        ...question === undefined ? {} : { ori_question: question },
-      },
-      decode: mapSearchResponse,
-      waitToSend: waitSignal => this.waitForRequestSlot(options.requestsPerSecond, waitSignal),
-      guidance: options.guidance,
-    }, signal)
+    const maxResults = Math.min(options.count, request.maxResults ?? options.count)
+    if (hasDeepSeekWebCredential(options.auth)) {
+      const question = boundedQuestion(options.originalQuestion?.())
+      try {
+        return await dispatchDeepSeekWeb(options.auth, {
+          body: {
+            query: request.query,
+            count: maxResults,
+            need_content: false,
+            ...question === undefined ? {} : { ori_question: question },
+          },
+          decode: mapSearchResponse,
+          waitToSend: waitSignal => this.waitForRequestSlot(options.requestsPerSecond, waitSignal),
+          guidance: options.guidance,
+        }, signal)
+      } catch (error) {
+        if (signal?.aborted === true) throw error
+      }
+    }
+    return searchDuckDuckGo(request.query, maxResults, signal)
   }
 
   /**
@@ -132,6 +140,87 @@ export class DeepSeekSearchApiProvider implements WebSearchProvider {
       await abortableDelay(oldest + 1001 - now, signal)
     }
   }
+}
+
+/**
+ * Query DuckDuckGo's HTML endpoint and extract `{ url, title, snippet }` results.
+ * Used when DeepSeek Search API credentials are absent or rejected (e.g. Ollama / custom APIs).
+ */
+async function searchDuckDuckGo(query: string, maxResults: number, signal?: AbortSignal): Promise<WebSearchResult> {
+  if (signal?.aborted === true) throw searchAborted(signal)
+  const endpoint = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`
+  const res = await fetch(endpoint, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+      'Accept-Language': 'en-US,en;q=0.9,fr;q=0.8',
+    },
+    ...(signal ? { signal } : {}),
+  })
+  if (!res.ok) {
+    throw invalidResponse()
+  }
+  const html = await res.text()
+  const sources: WebSearchResult['sources'] = []
+  const linkRegex = /<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/giu
+  const snippetRegex = /<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/giu
+
+  const links: Array<{ url: string; title: string }> = []
+  for (const match of html.matchAll(linkRegex)) {
+    const rawHref = decodeHtmlEntities(match[1] ?? '')
+    const url = extractDuckDuckGoTarget(rawHref)
+    const title = stripHtml(match[2] ?? '')
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      links.push({ url, title })
+    }
+  }
+
+  const snippets: string[] = []
+  for (const match of html.matchAll(snippetRegex)) {
+    snippets.push(stripHtml(match[1] ?? ''))
+  }
+
+  const limit = Math.max(1, Math.min(maxResults, 20))
+  for (let i = 0; i < links.length && sources.length < limit; i++) {
+    const link = links[i]!
+    const snippet = snippets[i] ?? ''
+    sources.push({
+      url: link.url,
+      ...(link.title.length > 0 ? { title: link.title } : {}),
+      ...(snippet.length > 0 ? { snippet } : {}),
+    })
+  }
+  return { sources, truncated: false }
+}
+
+/** Unwrap DuckDuckGo `/l/?uddg=...` redirect URLs into direct HTTP(S) URLs. */
+function extractDuckDuckGoTarget(rawHref: string): string {
+  const normalized = rawHref.startsWith('//') ? `https:${rawHref}` : rawHref
+  try {
+    const parsed = new URL(normalized)
+    const uddg = parsed.searchParams.get('uddg')
+    if (uddg && (uddg.startsWith('http://') || uddg.startsWith('https://'))) {
+      return uddg
+    }
+  } catch {
+    // Fall through to raw href when not a full URL
+  }
+  return normalized
+}
+
+/** Strip HTML tags and collapse whitespace. */
+function stripHtml(input: string): string {
+  return decodeHtmlEntities(input.replace(/<[^>]+>/gu, ' ')).replace(/\s+/gu, ' ').trim()
+}
+
+/** Decode common HTML entities. */
+function decodeHtmlEntities(input: string): string {
+  return input
+    .replace(/&amp;/gu, '&')
+    .replace(/&lt;/gu, '<')
+    .replace(/&gt;/gu, '>')
+    .replace(/&quot;/gu, '"')
+    .replace(/&#39;|&apos;/gu, "'")
+    .replace(/&nbsp;/gu, ' ')
 }
 
 /** Resolve after `ms`, or early when `signal` aborts; the caller rechecks the signal. */

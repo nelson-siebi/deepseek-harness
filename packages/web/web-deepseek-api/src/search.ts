@@ -160,7 +160,7 @@ async function searchDuckDuckGo(query: string, maxResults: number, signal?: Abor
     throw invalidResponse()
   }
   const html = await res.text()
-  const sources: WebSearchResult['sources'] = []
+  const sources: Array<WebSearchResult['sources'][number]> = []
   const linkRegex = /<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/giu
   const snippetRegex = /<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/giu
 
